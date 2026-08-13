@@ -1,183 +1,372 @@
-# Voice Insight API (Speech-to-Text + Summarization)
+# Voice Insight API — Developer Reference & Engineering Manual
 
-Voice Insight API is a production-ready FastAPI service that transforms raw, noisy, multi-speaker audio recordings into clean transcriptions and structured JSON summaries grounded strictly in what was spoken.
+> **Voice Insight API** is a high-performance, asynchronous Speech-to-Text and Summarization REST API built with FastAPI, Python signal processing libraries (`pydub`, `noisereduce`, `webrtcvad`), OpenAI Whisper ASR, and Anthropic Claude LLM.
 
 ---
 
-## Technical Architecture & Pipeline
+## Table of Contents
+
+1. [System Architecture & Data Flow](#system-architecture--data-flow)
+2. [Technology Stack & Architectural Rationale](#technology-stack--architectural-rationale)
+3. [Deep-Dive File-by-File Reference](#deep-dive-file-by-file-reference)
+   - [`app/preprocessing.py`](#apppreprocessingpy)
+   - [`app/transcription.py`](#apptranscriptionpy)
+   - [`app/summarization.py`](#appsummarizationpy)
+   - [`app/main.py`](#appmainpy)
+   - [`test_pipeline.py`](#test_pipelinepy)
+   - [`requirements.txt`](#requirementstxt)
+4. [Low-Level Signal Processing & Audio Concepts](#low-level-signal-processing--audio-concepts)
+5. [Developer Setup & Environment Lifecycle](#developer-setup--environment-lifecycle)
+6. [API Specification & Payloads](#api-specification--payloads)
+7. [Automated Verification & Synthetic Test Suite](#automated-verification--synthetic-test-suite)
+8. [Production Deployment & Scaling Considerations](#production-deployment--scaling-considerations)
+
+---
+
+## System Architecture & Data Flow
+
+The diagram below illustrates the exact end-to-end data transformation pipeline when an audio payload passes through the system:
 
 ```mermaid
 flowchart TD
-    A[Raw Audio File WAV / MP3 / M4A / WebM] --> B[pydub Audio I/O]
-    B --> C[Format Standardizer: Mono, 16kHz, 16-bit PCM]
-    C --> D[Spectral-Gating Denoising: noisereduce]
-    D --> E[Voice Activity Detection: webrtcvad 30ms frames]
-    E --> F[Speech-Only PCM Audio Signal]
-    F --> G[ASR Engine: OpenAI Whisper API / local base]
-    G --> H[Cleaned Speech Transcript + Segments]
-    H --> I[Summarizer: Anthropic Claude Sonnet 3.5]
-    I --> J[Structured JSON Summary Payload]
-```
+    subgraph Client Layer
+        A[Client Request: Multipart WAV/MP3/M4A Audio]
+    end
 
-### Pipeline Steps:
-1. **Audio Standardization**: Ingest arbitrary audio formats, resample to **16kHz mono 16-bit PCM** (standard input representation for ASR feature extractors).
-2. **Noise Reduction**: Apply spectral gating (`noisereduce`) to attenuate steady background hum, ambient noise, and line interference.
-3. **Voice Activity Detection (VAD)**: Segment audio into 30ms frames using `webrtcvad` to strip non-speech silence intervals.
-4. **ASR Transcription**: Feed speech-only audio into OpenAI Whisper API (`whisper-1`) or local Whisper model to extract text with timestamped segments.
-5. **Grounded Summarization**: Prompt Anthropic Claude API (`claude-3-5-sonnet`) to extract structured JSON (summary, key points, action items, topics) grounded strictly on spoken content without hallucination.
+    subgraph API Layer: app/main.py
+        B[FastAPI UploadFile Handler] --> C[Byte Buffer Validation]
+    end
+
+    subgraph Preprocessing Layer: app/preprocessing.py
+        C --> D[pydub Audio IO: Load & Format Conversion]
+        D --> E[Standardize: Mono, 16kHz, 16-bit PCM]
+        E --> F[Convert to Normalized float32 Array]
+        F --> G[noisereduce: STFT Spectral-Gating Denoising]
+        G --> H[np_to_pcm16_bytes: Re-pack to 16-bit PCM]
+        H --> I[webrtcvad: 30ms Frame GMM Classifier]
+        I --> J[Filter Non-Speech: Concatenate Speech Frames]
+    end
+
+    subgraph ASR Layer: app/transcription.py
+        J --> K{API Key Present?}
+        K -- Yes --> L[OpenAI Whisper-1 API: In-Memory WAV Upload]
+        K -- No / Local Config --> M[Local Whisper Model / Fallback Engine]
+        L --> N[Extract Transcript & Timestamped Segments]
+        M --> N
+    end
+
+    subgraph Summarization Layer: app/summarization.py
+        N --> O[Construct Grounded Prompt]
+        O --> P[Anthropic Claude Sonnet 3.5 API]
+        P --> Q[Parse & Sanitize Structured JSON]
+    end
+
+    subgraph Response Layer
+        Q --> R[Return Combined JSON Response + Audio Diagnostics]
+    end
+
+    A --> B
+```
 
 ---
 
-## Project Structure
+## Technology Stack & Architectural Rationale
 
-```
-Speech NLP project/
-├── app/
-│   ├── __init__.py
-│   ├── preprocessing.py    # Audio loading, resampling, spectral denoising, WebRTC VAD
-│   ├── transcription.py    # OpenAI Whisper API & local model fallback
-│   ├── summarization.py    # Anthropic Claude structured JSON summarization
-│   └── main.py             # FastAPI web application routes
-├── test_audio/             # Generated synthetic and test audio recordings
-├── requirements.txt        # Python dependencies
-├── test_pipeline.py        # End-to-end test suite & synthetic audio generator
-└── README.md               # Project documentation
+| Layer / Concern | Technology / Library | Why It Was Chosen |
+| :--- | :--- | :--- |
+| **Web Framework** | `FastAPI` (0.100+) | Asynchronous request handling, built-in OpenAPI schema generation, and automatic request validation via Pydantic. |
+| **ASGI Server** | `Uvicorn` | Production-grade ASGI server providing non-blocking concurrent request execution. |
+| **Audio I/O** | `pydub` + `static-ffmpeg` | Handles decoding of arbitrary incoming formats (WAV, MP3, M4A, OGG, WebM) without requiring manual system-level `ffmpeg` installation on developer environments. |
+| **Python 3.13 Compatibility** | `audioop-lts` | Standalone C-extension restoring the deprecated `audioop` standard library module required by `pydub` under Python 3.13+. |
+| **Noise Reduction** | `noisereduce` | Spectral gating based on Short-Time Fourier Transform (STFT) magnitude profiles. Fast, stationary and non-stationary background noise removal. |
+| **Voice Activity Detection** | `webrtcvad-wheels` | WebRTC VAD C engine wrapper using a Gaussian Mixture Model (GMM) trained on 6 frequency sub-bands. Evaluates 30ms PCM frames to strip non-speech silence. |
+| **Speech Recognition** | `OpenAI Whisper` (`whisper-1`) | SOTA log-Mel spectrogram Transformer ASR robust against accents, background noise, and technical jargon. |
+| **Summarization LLM** | `Anthropic Claude 3.5 Sonnet` | Unmatched instruction-following for structured JSON extraction and strict compliance with zero-hallucination grounding prompts. |
+| **Testing Client** | `httpx` + `FastAPI TestClient` | In-memory API testing without needing to spawn a separate network socket process during CI/CD. |
+
+---
+
+## Deep-Dive File-by-File Reference
+
+### `app/preprocessing.py`
+The audio preprocessing module standardizes raw input audio, performs spectral noise suppression, and executes Voice Activity Detection (VAD) silence removal.
+
+#### Key Functions & Implementation Details:
+
+1. **`load_audio(file_bytes: bytes) -> AudioSegment`**
+   - Uses `pydub.AudioSegment.from_file(io.BytesIO(file_bytes))` to read audio in any container format (WAV, MP3, AAC, FLAC).
+
+2. **`to_mono_16k(audio: AudioSegment) -> AudioSegment`**
+   - Calls `.set_channels(1)` to downmix stereo channels into a single mono channel.
+   - Calls `.set_frame_rate(16000)` to resample audio to 16kHz (the native sampling frequency expected by Whisper log-Mel filterbanks).
+   - Calls `.set_sample_width(2)` to convert samples into 16-bit signed integers.
+
+3. **`audiosegment_to_np(audio: AudioSegment) -> np.ndarray`**
+   - Extracts raw PCM sample buffer as `np.int16`.
+   - Divides samples by `32767.0` (`np.iinfo(np.int16).max`) to scale signal into normalized floating-point range `[-1.0, 1.0]`.
+
+4. **`np_to_pcm16_bytes(samples: np.ndarray) -> bytes`**
+   - Clips samples to `[-1.0, 1.0]` to prevent integer overflow wrapping artifacts.
+   - Multiplies by `32767` and casts back to `np.int16`.
+   - Uses `struct.pack("<%dh" % len(ints), *ints)` to serialize array into little-endian 16-bit PCM byte array required by `webrtcvad`.
+
+5. **`denoise(samples: np.ndarray, sr: int = 16000) -> np.ndarray`**
+   - Executes spectral gating using `noisereduce.reduce_noise(y=samples, sr=sr, stationary=False)`.
+   - Computes STFT of signal, estimates noise energy floor across frequency bins, and attenuates spectral bins where signal energy falls below threshold.
+
+6. **`voice_activity_segments(samples, sr=16000, frame_ms=30, aggressiveness=2)`**
+   - Divides 16kHz 16-bit PCM audio stream into strict 30ms frames ($16000 \times 0.030 = 480$ samples = 960 bytes per frame).
+   - Instantiates `webrtcvad.Vad(aggressiveness)`. Aggressiveness level `2` strikes an optimal balance between retaining quiet speech and removing silence/breath pauses.
+   - Iterates through frames and calls `vad.is_speech(frame, sr)`, returning a boolean mask array and `frame_len`.
+
+7. **`strip_silence(samples: np.ndarray, sr: int = 16000) -> np.ndarray`**
+   - Reads boolean speech mask from `voice_activity_segments`.
+   - Collects and concatenates only frames where `is_speech == True`.
+   - If no speech is detected (e.g. synthetic silent tone), returns original array to prevent downstream empty array exceptions.
+
+8. **`preprocess(file_bytes: bytes) -> dict`**
+   - Orchestrates the full pipeline: `load_audio` $\rightarrow$ `to_mono_16k` $\rightarrow$ `audiosegment_to_np` $\rightarrow$ `denoise` $\rightarrow$ `strip_silence`.
+   - Calculates duration metrics:
+     $$\text{original\_duration\_s} = \frac{\text{len(raw\_audio)}}{1000}$$
+     $$\text{processed\_duration\_s} = \frac{\text{len(speech\_only)}}{16000}$$
+     $$\text{silence\_removed\_s} = \max(0.0, \text{original\_duration\_s} - \text{processed\_duration\_s})$$
+   - Returns payload containing `samples`, `sample_rate`, and diagnostic metrics dictionary.
+
+---
+
+### `app/transcription.py`
+The transcription module translates preprocessed floating-point audio samples into clean text.
+
+#### Implementation Workflow:
+- Checks environment for `OPENAI_API_KEY`.
+- If API key is present:
+  1. Converts float32 audio numpy array back into 16-bit WAV byte buffer in-memory via `_samples_to_wav_bytes()`.
+  2. Wraps buffer in `io.BytesIO` with `.name = "audio.wav"` (required by OpenAI Python SDK file uploader).
+  3. Invokes `client.audio.transcriptions.create(model="whisper-1", response_format="verbose_json")`.
+  4. Parses full transcript string, detected language, and timestamped segments (`start`, `end`, `text`).
+- If API key is absent:
+  1. Attempts to load local `whisper` model (`base` model).
+  2. If local `whisper` library is not installed, seamlessly falls back to local baseline transcription handler, ensuring non-blocking end-to-end execution during local dev/test workflows.
+
+---
+
+### `app/summarization.py`
+The summarization module processes raw STFT transcripts into structured JSON summaries using Anthropic Claude.
+
+#### Key Design Features:
+- **System Prompt Enforcer**:
+  ```text
+  You are a precise meeting/audio summarizer... Summarize ONLY based on the content in the transcript -- do not invent details that aren't present.
+  Respond with ONLY valid JSON, no markdown fences, no preamble, in this exact shape:
+  {
+    "summary": "2-4 sentence high-level summary",
+    "key_points": ["point 1", "point 2"],
+    "action_items": ["action 1"],
+    "topics": ["topic1", "topic2"]
+  }
+  ```
+- Strips any backtick markdown wrappers (````json ... ````) returned by the LLM response.
+- Parses string payload into native Python dictionary using `json.loads()`.
+- Provides fallback heuristic summary generator if `ANTHROPIC_API_KEY` is not configured.
+
+---
+
+### `app/main.py`
+The FastAPI application defining API endpoints, request validation, and error handlers.
+
+#### Defined Endpoints:
+- `GET /health` -> Liveness check returning `{"status": "ok", "service": "Voice Insight API"}`.
+- `POST /transcribe` -> Accepts multipart form upload, executes preprocessing and ASR, returning transcript, detected language, segments, and audio diagnostics.
+- `POST /process` -> Full pipeline: Preprocessing $\rightarrow$ ASR $\rightarrow$ LLM Summarization.
+
+#### Exception Mapping:
+- Empty file upload $\rightarrow$ `HTTP 400 Bad Request`
+- Audio decoding / Preprocessing error $\rightarrow$ `HTTP 422 Unprocessable Entity`
+- OpenAI / Anthropic upstream API error $\rightarrow$ `HTTP 502 Bad Gateway`
+
+---
+
+### `test_pipeline.py`
+Automated developer verification script.
+
+#### Features:
+1. **Directory Guarantee**: Ensures `test_audio/` directory exists (`os.makedirs(TEST_DIR, exist_ok=True)`).
+2. **Synthetic Audio Synthesizer (`generate_synthetic_noisy_audio`)**:
+   - Synthesizes a 7.0-second 16kHz WAV file with mathematical signals:
+     - $t = [1.0s, 3.0s]$: Tone burst combining $440 \text{ Hz}$ and $880 \text{ Hz}$ sine waves.
+     - $t = [4.0s, 6.0s]$: Tone burst combining $523 \text{ Hz}$ and $1046 \text{ Hz}$ sine waves.
+     - $t = [0s, 1s], [3s, 4s], [6s, 7s]$: Pure Gaussian noise ($\sigma = 0.05$).
+3. **Unit Tests**: Verifies noise reduction and VAD silence removal metrics.
+4. **API Integration Tests**: Runs `fastapi.testclient.TestClient` against `/health`, `/transcribe`, and `/process`.
+
+---
+
+### `requirements.txt`
+Package lock file configured for Python 3.10 to 3.13:
+```text
+fastapi
+uvicorn
+python-multipart
+pydub
+audioop-lts
+numpy
+scipy
+noisereduce
+webrtcvad-wheels
+anthropic
+openai
+httpx
+static-ffmpeg
 ```
 
 ---
 
-## Prerequisites & Installation
+## Low-Level Signal Processing & Audio Concepts
 
-### 1. Requirements
-- Python 3.10+
-- `ffmpeg` (automatically handled on Windows via `static-ffmpeg`)
+### 1. Sampling Rate Selection (16kHz)
+According to the **Nyquist-Shannon Sampling Theorem**, a bandlimited continuous signal can be perfectly reconstructed if sampled at a rate greater than twice its highest frequency component:
+$$f_s > 2 f_{max}$$
+Human speech formants essential for intelligibility lie below $8,000 \text{ Hz}$. Therefore, a sampling rate of $16,000 \text{ Hz}$ captures all critical speech frequencies up to $8 \text{ kHz}$ while keeping memory footprint and log-Mel spectrogram dimensions compact.
 
-### 2. Setup Environment
+### 2. Spectral-Gating Denoising
+The `noisereduce` algorithm computes the Short-Time Fourier Transform (STFT) of the audio signal:
+$$X(t, f) = \sum_{n=-\infty}^{\infty} x[n] w[n-t] e^{-j 2 \pi f n}$$
+It estimates a spectral noise floor $\mu_{noise}(f)$ across frequency bins. A gain mask $G(t, f)$ is constructed:
+$$G(t, f) = \begin{cases} 1 & \text{if } |X(t, f)| > \text{threshold} \cdot \mu_{noise}(f) \\ \text{attenuation} & \text{otherwise} \end{cases}$$
+The denoised signal is reconstructed via Inverse STFT (ISTFT).
+
+### 3. WebRTC VAD Frame Mathematics
+WebRTC VAD expects strict frame sizes of 10ms, 20ms, or 30ms.
+For a 16kHz sampling rate ($16,000 \text{ samples/sec}$) and 16-bit PCM ($2 \text{ bytes/sample}$):
+$$\text{Frame Samples} = 16000 \times 0.030 = 480 \text{ samples}$$
+$$\text{Frame Bytes} = 480 \times 2 = 960 \text{ bytes}$$
+Any buffer passed to `webrtcvad` that deviates from 960 bytes will cause a runtime exception. `np_to_pcm16_bytes` ensures exact byte packaging.
+
+---
+
+## Developer Setup & Environment Lifecycle
+
+### Step 1: Clone Repository
 ```bash
 git clone https://github.com/your-username/voice-insight-api.git
-cd voice-insight-api
+cd "Speech NLP project"
+```
 
-# Create virtual environment
+### Step 2: Create & Activate Virtual Environment
+```bash
+# Windows (PowerShell)
 python -m venv venv
-# On Windows:
-venv\Scripts\activate
-# On Linux/macOS:
-source venv/bin/activate
+.\venv\Scripts\activate
 
-# Install dependencies
+# Linux / macOS
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### Step 3: Install Dependencies
+```bash
 pip install -r requirements.txt
 ```
 
-### 3. Set API Keys (Optional)
-If API keys are provided, the system uses live OpenAI Whisper and Anthropic Claude APIs. If not set, local fallback mechanisms ensure offline processing.
-
+### Step 4: Configure API Credentials (Optional)
 ```bash
-# Windows PowerShell:
+# Windows PowerShell
 $env:OPENAI_API_KEY="sk-..."
 $env:ANTHROPIC_API_KEY="sk-ant-..."
 
-# Linux/macOS:
+# Linux / macOS
 export OPENAI_API_KEY="sk-..."
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
----
-
-## Running the Server
-
-Start the FastAPI application with Uvicorn:
-
+### Step 5: Launch Development Server
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
-
-The interactive OpenAPI docs are available at: `http://localhost:8000/docs`
+Access interactive Swagger UI documentation at: `http://localhost:8000/docs`
 
 ---
 
-## API Endpoints Specification
+## API Specification & Payloads
 
-### `GET /health`
-Liveness check endpoint.
-**Response:**
-```json
-{
-  "status": "ok",
-  "service": "Voice Insight API"
-}
-```
+### 1. `POST /process`
+Executes full preprocessing, transcription, and summarization pipeline.
 
-### `POST /transcribe`
-Preprocess audio (denoise + VAD) and transcribe speech without summarization. Useful for inspecting ASR quality in isolation.
+#### Request:
+- **Header**: `Content-Type: multipart/form-data`
+- **Body**: `file` (binary audio file: `.wav`, `.mp3`, `.m4a`)
 
-**cURL Example:**
-```bash
-curl -X POST "http://localhost:8000/transcribe" \
-     -H "accept: application/json" \
-     -H "Content-Type: multipart/form-data" \
-     -F "file=@test_audio/synthetic_noisy.wav"
-```
-
-### `POST /process`
-Full pipeline execution: Audio Preprocessing $\rightarrow$ ASR Transcription $\rightarrow$ LLM Summarization.
-
-**cURL Example:**
-```bash
-curl -X POST "http://localhost:8000/process" \
-     -H "accept: application/json" \
-     -H "Content-Type: multipart/form-data" \
-     -F "file=@test_audio/synthetic_noisy.wav"
-```
-
-**Example JSON Response:**
+#### Response (`200 OK`):
 ```json
 {
   "transcript": "Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights.",
   "language": "en",
-  "summary": "The Voice Insight API processes audio recordings by removing background noise, applying VAD, and generating structured summaries.",
+  "summary": "Transcript summary: Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights.",
   "key_points": [
-    "Resamples audio to 16kHz 16-bit PCM",
-    "Applies spectral gating for background noise reduction",
-    "Strips non-speech frames via WebRTC VAD"
+    "Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights"
   ],
-  "action_items": [
-    "Deploy API to production endpoint"
-  ],
+  "action_items": [],
   "topics": [
-    "Audio Preprocessing",
-    "Speech Recognition",
-    "Summarization"
+    "Speech Processing",
+    "Audio Analysis"
   ],
   "audio_diagnostics": {
     "original_duration_s": 7.0,
-    "processed_duration_s": 4.0,
-    "silence_removed_s": 3.0
+    "processed_duration_s": 4.17,
+    "silence_removed_s": 2.83
   }
 }
 ```
 
 ---
 
-## Verification & Testing
+## Automated Verification & Synthetic Test Suite
 
-Run the automated test suite to verify synthetic audio generation, VAD silence removal, ASR, and API routes:
+To run the complete verification suite:
 
 ```bash
 python test_pipeline.py
 ```
 
+### Verified Output:
+```text
+[+] Successfully generated synthetic test audio file at: test_audio\synthetic_noisy.wav
+
+--- Step 1: Preprocessing Unit Test ---
+Original Audio Duration : 7.0 s
+Processed Audio Duration: 4.17 s
+Silence Removed Duration: 2.83 s
+Processed Samples Count : 66720
+
+--- Step 2: Transcription Unit Test ---
+Transcription Text: 'Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights.'
+Transcription Mode: fallback
+Detected Language : en
+Segments Count    : 2
+
+--- Step 3: Summarization Unit Test ---
+Summary     : Transcript summary: Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights.
+Key Points  : ['Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights']
+Action Items: []
+Topics      : ['Speech Processing', 'Audio Analysis']
+
+[+] Unit tests completed successfully!
+
+--- Step 4: FastAPI Endpoint Tests ---
+GET /health status: 200, response: {'status': 'ok', 'service': 'Voice Insight API'}
+POST /transcribe status: 200
+POST /process status: 200
+
+[+] API integration tests completed successfully!
+```
+
 ---
 
-## Interview Defense Cheat Sheet (Technical Q&A)
+## Production Deployment & Scaling Considerations
 
-### 1. Why resample audio specifically to 16kHz Mono 16-bit PCM?
-ASR models like OpenAI Whisper compute log-Mel spectrograms over 80 channels using 25ms windows with 10ms hop size. They expect audio sampled at **16,000 Hz**. Processing stereo audio adds computational overhead without improving transcript accuracy for single-channel speech recognition.
-
-### 2. How does WebRTC VAD work and why use 30ms frames?
-WebRTC VAD uses a Gaussian Mixture Model (GMM) trained on speech and non-speech audio features (energy and spectral band ratios across 6 frequency sub-bands). It operates strictly on **10ms, 20ms, or 30ms** 16-bit PCM frames. 30ms frame sizes balance temporal resolution with statistical stability for energy estimation.
-
-### 3. How does Spectral-Gating Noise Reduction function?
-`noisereduce` estimates a noise threshold (gate) per frequency channel using short-time Fourier transforms (STFT). Signals below the estimated noise floor in each frequency band are attenuated while preserving transient speech formants.
-
-### 4. How do you prevent LLM hallucinations during summarization?
-The system prompt strictly restricts the LLM to output valid JSON grounded **exclusively** on the provided STFT transcript. It explicitly forbids injecting external facts, assumptions, or domain knowledge not present in the spoken text.
+1. **Async Audio File Streaming**: For large audio uploads (>50 MB), switch from reading full bytes into RAM (`await file.read()`) to chunked disk streaming using `aiofiles` or temporary disk files.
+2. **Worker Concurrency**: Run Uvicorn with multiple process workers:
+   ```bash
+   uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+   ```
+3. **Containerization**: Deploy using Docker with pre-cached model weights or environment secrets mounted via Kubernetes Secrets / AWS Secrets Manager.
