@@ -320,44 +320,63 @@ Executes full preprocessing, transcription, and summarization pipeline.
 
 ---
 
-## Automated Verification & Synthetic Test Suite
+## Explicit Fail-Hard Safety Policy
 
-To run the complete verification suite:
+To prevent any fabrication of ASR or LLM experimental results:
+1. **Zero Silent Fallback Stubs**: The codebase contains **no** hardcoded mock transcript strings or fake summary generators.
+2. **Explicit Failure Handlers**: If `OPENAI_API_KEY` (or local `openai-whisper`) is unconfigured, `transcribe()` raises an explicit `ValueError` / `RuntimeError`. If `ANTHROPIC_API_KEY` is missing, `summarize()` raises an explicit `ValueError`.
+3. **HTTP 502 Mapping**: FastAPI routes (`/transcribe` and `/process`) map upstream configuration or API errors to `HTTP 502 Bad Gateway` with actionable diagnostic messages.
+
+---
+
+## Automated Verification & Real Speech Audio Test Suite
+
+To run the complete verification suite using genuine synthesized human speech (`gTTS`) mixed with Gaussian background noise and silence padding:
 
 ```bash
 python test_pipeline.py
 ```
 
-### Verified Output:
+### Actual Verified Output Log (Real Speech Audio + Local Whisper ASR):
+
 ```text
-[+] Successfully generated synthetic test audio file at: test_audio\synthetic_noisy.wav
+[+] Successfully generated real noisy speech audio at: test_audio\real_speech_noisy.wav
+    Spoken Text Reference: 'Welcome to the Voice Insight API demonstration. We are testing speech recognition and transcript summarization with real background noise and silence detection.'
 
---- Step 1: Preprocessing Unit Test ---
-Original Audio Duration : 7.0 s
-Processed Audio Duration: 4.17 s
-Silence Removed Duration: 2.83 s
-Processed Samples Count : 66720
+--- Step 1: Preprocessing Unit Test (Real Audio) ---
+Original Audio Duration : 14.76 s
+Processed Audio Duration: 11.31 s
+Silence Removed Duration: 3.45 s
+Processed Samples Count : 180960
 
---- Step 2: Transcription Unit Test ---
-Transcription Text: 'Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights.'
-Transcription Mode: fallback
+--- Step 2: Transcription Verification (Real Whisper ASR) ---
+Transcription Text: 'Welcome to the Voice Inside 3 Demonstration. We are testing each recognition and transfer tenderization with real background noise and silence detection.'
+Transcription Mode: local_whisper
 Detected Language : en
-Segments Count    : 2
 
---- Step 3: Summarization Unit Test ---
-Summary     : Transcript summary: Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights.
-Key Points  : ['Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights']
-Action Items: []
-Topics      : ['Speech Processing', 'Audio Analysis']
+--- Step 3: Summarization Verification ---
+[EXPLICIT SAFETY CHECK PASSED] Summarizer failed hard as expected when key is unconfigured: ANTHROPIC_API_KEY environment variable is not set. Please set ANTHROPIC_API_KEY to enable Claude-powered summarization.
 
-[+] Unit tests completed successfully!
+[+] Unit & verification tests completed successfully!
 
 --- Step 4: FastAPI Endpoint Tests ---
 GET /health status: 200, response: {'status': 'ok', 'service': 'Voice Insight API'}
 POST /transcribe status: 200
-POST /process status: 200
+POST /transcribe payload: {
+  'transcript': 'Welcome to the Voice Inside 3 Demonstration. We are testing each recognition and transfer tenderization with real background noise and silence detection.',
+  'language': 'en',
+  'segments': [
+    {'start': 0.0, 'end': 3.04, 'text': 'Welcome to the Voice Inside 3 Demonstration.'},
+    {'start': 3.04, 'end': 8.48, 'text': 'We are testing each recognition and transfer tenderization with real background noise and'},
+    {'start': 8.48, 'end': 16.48, 'text': 'silence detection.'}
+  ],
+  'transcription_mode': 'local_whisper',
+  'audio_diagnostics': {'original_duration_s': 14.76, 'processed_duration_s': 11.31, 'silence_removed_s': 3.45}
+}
+POST /process status: 502
+POST /process error detail: {'detail': 'Summarization failed: ANTHROPIC_API_KEY environment variable is not set. Please set ANTHROPIC_API_KEY to enable Claude-powered summarization.'}
 
-[+] API integration tests completed successfully!
+[+] API integration test suite completed successfully!
 ```
 
 ---
@@ -370,3 +389,5 @@ POST /process status: 200
    uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
    ```
 3. **Containerization**: Deploy using Docker with pre-cached model weights or environment secrets mounted via Kubernetes Secrets / AWS Secrets Manager.
+
+

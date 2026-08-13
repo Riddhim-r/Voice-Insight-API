@@ -44,8 +44,8 @@ def _samples_to_wav_bytes(samples: np.ndarray, sr: int) -> bytes:
 
 def transcribe(samples: np.ndarray, sample_rate: int) -> dict:
     """
-    Transcribe preprocessed audio samples. Returns transcript text plus
-    detected language and timestamped segments.
+    Transcribe preprocessed audio samples using OpenAI Whisper API or local Whisper model.
+    Fails explicitly if no valid ASR engine or API key is configured.
     """
     api_key = os.environ.get("OPENAI_API_KEY") or OPENAI_API_KEY
     use_local = USE_LOCAL_WHISPER or not api_key
@@ -64,16 +64,16 @@ def transcribe(samples: np.ndarray, sample_rate: int) -> dict:
                 "mode": "local_whisper",
             }
         except Exception as local_err:
-            logger.warning(f"Local Whisper model unavailable or failed: {local_err}. Using baseline fallback.")
-            return {
-                "text": "Transcribed speech sample: The Voice Insight API processes audio and summarizes key insights.",
-                "language": "en",
-                "segments": [
-                    {"start": 0.0, "end": 2.5, "text": "Transcribed speech sample:"},
-                    {"start": 2.5, "end": 5.0, "text": "The Voice Insight API processes audio and summarizes key insights."}
-                ],
-                "mode": "fallback",
-            }
+            raise RuntimeError(
+                f"Local Whisper transcription failed: {local_err}. "
+                "Ensure 'openai-whisper' is installed or provide a valid OPENAI_API_KEY."
+            ) from local_err
+
+    if not api_key:
+        raise ValueError(
+            "OPENAI_API_KEY environment variable is not set. "
+            "Set OPENAI_API_KEY to use OpenAI Whisper API or set USE_LOCAL_WHISPER=True with local whisper installed."
+        )
 
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
@@ -105,3 +105,4 @@ def transcribe(samples: np.ndarray, sample_rate: int) -> dict:
         "segments": segments,
         "mode": "openai_api",
     }
+

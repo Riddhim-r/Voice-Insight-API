@@ -11,4 +11,5 @@ anthropic
 openai
 httpx
 static-ffmpeg
-
+gtts
+openai-whisper

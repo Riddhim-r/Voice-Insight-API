@@ -26,29 +26,20 @@ Respond with ONLY valid JSON, no markdown fences, no preamble, in this exact sha
 If there are no clear action items, return an empty list for that field."""
 
 
-def _fallback_summary(transcript_text: str) -> dict:
-    """Fallback summarizer when ANTHROPIC_API_KEY is not set or call fails."""
-    sentences = [s.strip() for s in transcript_text.split(".") if s.strip()]
-    high_level = ". ".join(sentences[:2]) + "." if sentences else "Audio transcript recorded successfully."
-    key_points = sentences[:3] if sentences else ["Audio processing completed."]
-    
-    return {
-        "summary": f"Transcript summary: {high_level}",
-        "key_points": key_points,
-        "action_items": [],
-        "topics": ["Speech Processing", "Audio Analysis"],
-        "_mode": "fallback",
-    }
-
-
 def summarize(transcript_text: str) -> dict:
+    """
+    Summarize a transcript using Anthropic Claude API.
+    Fails explicitly if ANTHROPIC_API_KEY is not set or API call fails.
+    """
     if not transcript_text.strip():
         return {"summary": "", "key_points": [], "action_items": [], "topics": []}
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        logger.info("ANTHROPIC_API_KEY not set. Using fallback summarizer.")
-        return _fallback_summary(transcript_text)
+        raise ValueError(
+            "ANTHROPIC_API_KEY environment variable is not set. "
+            "Please set ANTHROPIC_API_KEY to enable Claude-powered summarization."
+        )
 
     try:
         client = anthropic.Anthropic(api_key=api_key)
@@ -86,5 +77,5 @@ def summarize(transcript_text: str) -> dict:
                 "_mode": "anthropic_claude",
             }
     except Exception as e:
-        logger.warning(f"Anthropic API call failed: {e}. Using fallback summarizer.")
-        return _fallback_summary(transcript_text)
+        raise RuntimeError(f"Anthropic Claude API summarization failed: {e}") from e
+
