@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+venv/
+.venv/
+env/
+
+# Environment Variables & Secrets
+.env
+*.env
+
+# Generated Audio Artifacts (keep directory structure if needed)
+test_audio/*.wav
+!test_audio/.gitkeep
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

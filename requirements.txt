@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+pydub
+audioop-lts
+numpy
+scipy
+noisereduce
+webrtcvad-wheels
+anthropic
+openai
+httpx
+static-ffmpeg
+
