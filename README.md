@@ -26,8 +26,8 @@ flowchart LR
 ## Run it
 
 ```bash
-git clone https://github.com/Riddhim-r/Voice-Insight-API.git
-cd Voice-Insight-API
+git clone https://github.com/Riddhim-r/voice-insight-api.git
+cd voice-insight-api
 python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
